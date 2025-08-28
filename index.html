@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Simple P2P Call — Shareable Link Signaling</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      body {
+        font-family: Arial, Helvetica, sans-serif;
+        max-width: 900px;
+        margin: 18px auto;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 18px;
+        margin-bottom: 6px;
+      }
+      video {
+        width: 320px;
+        height: 240px;
+        background: #000;
+        border-radius: 6px;
+        object-fit: cover;
+      }
+      #remotes video {
+        width: 320px;
+        height: 240px;
+        margin-left: 10px;
+      }
+      button {
+        padding: 8px 12px;
+        margin: 6px;
+      }
+      input {
+        padding: 8px;
+        margin: 6px 0;
+        width: 100%;
+      }
+      .row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .panel {
+        border: 1px solid #ddd;
+        padding: 12px;
+        border-radius: 8px;
+        background: #fbfbfb;
+        margin-bottom: 12px;
+      }
+      .small {
+        font-size: 12px;
+        color: #555;
+      }
+      .linkbox {
+        word-break: break-all;
+        background: #fff;
+        padding: 8px;
+        border-radius: 6px;
+        border: 1px solid #eee;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Simple P2P Audio+Video Call — Shareable-link Signaling (No server)</h1>
+
+    <div class="panel row">
+      <div>
+        <video id="localVideo" autoplay muted playsinline></video>
+        <div class="small">Local preview (mirrored)</div>
+      </div>
+
+      <div>
+        <div style="margin-bottom: 8px">
+          <button id="startBtn">Start Camera & Mic</button>
+          <button id="createLinkBtn" disabled>Create Offer Link</button>
+          <button id="acceptFromLinkBtn">Accept Offer from URL</button>
+        </div>
+
+        <div style="margin-top: 8px">
+          <button id="muteBtn" disabled>Mute</button>
+          <button id="camBtn" disabled>Camera Off</button>
+          <button id="endBtn" disabled>End Call</button>
+        </div>
+
+        <p class="small">
+          Flow: Create Offer → send offer link to friend → friend opens link &
+          Accept → friend sends back Answer link → you open Answer link.
+        </p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <label><strong>Shareable Offer Link (send this to friend)</strong></label>
+      <div id="offerLink" class="linkbox">No link yet</div>
+      <div style="margin-top: 6px">
+        <button id="copyOfferBtn" disabled>Copy Offer Link</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <label
+        ><strong
+          >Answer Link (generated after accepting an offer — send back to
+          initiator)</strong
+        ></label
+      >
+      <div id="answerLink" class="linkbox">No answer yet</div>
+      <div style="margin-top: 6px">
+        <button id="copyAnswerBtn" disabled>Copy Answer Link</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <label><strong>Manual paste (optional)</strong></label>
+      <div class="small">
+        If you received a full link, paste it below and click "Open Link" to
+        handle incoming offer/answer.
+      </div>
+      <input
+        id="pasteLink"
+        placeholder="Paste a full link you received (offer or answer)"
+      />
+      <div>
+        <button id="openLinkBtn">Open Link</button>
+      </div>
+    </div>
+
+    <div style="margin-top: 10px" class="row">
+      <div id="status" class="small panel" style="flex: 1">Status: idle</div>
+      <div id="timer" class="small panel">Timer: 00:00</div>
+    </div>
+
+    <h3>Remote</h3>
+    <div id="remotes" class="row"></div>
+
+    <script>
+      /*
+  Simple single-file WebRTC with offer/answer encoded into shareable links.
+  - No backend
+  - Uses ICE-gathering completion so the link contains ICE candidates
+  - Two links needed: Offer link (initiator -> recipient), Answer link (recipient -> initiator)
+*/
+
+      const localVideo = document.getElementById("localVideo");
+      const remotes = document.getElementById("remotes");
+      const startBtn = document.getElementById("startBtn");
+      const createLinkBtn = document.getElementById("createLinkBtn");
+      const acceptFromLinkBtn = document.getElementById("acceptFromLinkBtn");
+      const copyOfferBtn = document.getElementById("copyOfferBtn");
+      const copyAnswerBtn = document.getElementById("copyAnswerBtn");
+      const offerLinkBox = document.getElementById("offerLink");
+      const answerLinkBox = document.getElementById("answerLink");
+      const pasteLinkInput = document.getElementById("pasteLink");
+      const openLinkBtn = document.getElementById("openLinkBtn");
+      const muteBtn = document.getElementById("muteBtn");
+      const camBtn = document.getElementById("camBtn");
+      const endBtn = document.getElementById("endBtn");
+      const statusEl = document.getElementById("status");
+      const timerEl = document.getElementById("timer");
+
+      let localStream = null;
+      let pc = null;
+      let remoteVideoEl = null;
+      let callTimer = null;
+      let secs = 0;
+
+      const ICE_CONFIG = {
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      };
+
+      // helpers
+      function setStatus(s) {
+        statusEl.textContent = "Status: " + s;
+        console.log(s);
+      }
+      function formatTime(s) {
+        return (
+          String(Math.floor(s / 60)).padStart(2, "0") +
+          ":" +
+          String(s % 60).padStart(2, "0")
+        );
+      }
+      function startTimer() {
+        if (callTimer) return;
+        secs = 0;
+        timerEl.textContent = "Timer: 00:00";
+        callTimer = setInterval(() => {
+          secs++;
+          timerEl.textContent = "Timer: " + formatTime(secs);
+        }, 1000);
+      }
+      function stopTimer() {
+        if (callTimer) clearInterval(callTimer);
+        callTimer = null;
+        timerEl.textContent = "Timer: 00:00";
+      }
+
+      // encode/decode compact payload in URL fragment
+      function encodePayload(obj) {
+        const json = JSON.stringify(obj);
+        // base64 url-safe
+        return btoa(unescape(encodeURIComponent(json)))
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/, "");
+      }
+      function decodePayload(str) {
+        try {
+          const padded = str.replace(/-/g, "+").replace(/_/g, "/");
+          const json = decodeURIComponent(escape(atob(padded)));
+          return JSON.parse(json);
+        } catch (e) {
+          return null;
+        }
+      }
+
+      // UI actions
+      startBtn.onclick = async () => {
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            audio: true,
+            video: true,
+          });
+          localVideo.srcObject = localStream;
+          startBtn.disabled = true;
+          createLinkBtn.disabled = false;
+          muteBtn.disabled = false;
+          camBtn.disabled = false;
+          setStatus("local media ready");
+        } catch (e) {
+          alert("Error accessing camera/mic: " + e.message);
+          setStatus("media error");
+        }
+      };
+
+      muteBtn.onclick = () => {
+        if (!localStream) return;
+        const t = localStream.getAudioTracks()[0];
+        t.enabled = !t.enabled;
+        muteBtn.textContent = t.enabled ? "Mute" : "Unmute";
+      };
+
+      camBtn.onclick = () => {
+        if (!localStream) return;
+        const t = localStream.getVideoTracks()[0];
+        t.enabled = !t.enabled;
+        camBtn.textContent = t.enabled ? "Camera Off" : "Camera On";
+      };
+
+      endBtn.onclick = () => {
+        hangup();
+      };
+
+      // create peer connection helper
+      function setupPeerConnection() {
+        pc = new RTCPeerConnection(ICE_CONFIG);
+        // remote video
+        remoteVideoEl = document.createElement("video");
+        remoteVideoEl.autoplay = true;
+        remoteVideoEl.playsInline = true;
+        remotes.innerHTML = "";
+        remotes.appendChild(remoteVideoEl);
+
+        pc.ontrack = (ev) => {
+          // attach first stream
+          remoteVideoEl.srcObject = ev.streams[0];
+          setStatus("remote track received");
+        };
+        pc.onconnectionstatechange = () => {
+          setStatus("pc state: " + pc.connectionState);
+          if (pc.connectionState === "connected") startTimer();
+          if (
+            ["disconnected", "failed", "closed"].includes(pc.connectionState)
+          ) {
+            stopTimer();
+          }
+        };
+        pc.oniceconnectionstatechange = () => {
+          console.log("iceConnectionState", pc.iceConnectionState);
+        };
+        // add local tracks
+        if (localStream)
+          localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+        return pc;
+      }
+
+      // Wait until ICE gathering finishes (or timeout)
+      function waitForIceGatheringComplete(pc, timeout = 7000) {
+        return new Promise((resolve) => {
+          if (!pc) return resolve();
+          if (pc.iceGatheringState === "complete") return resolve();
+          const onState = () => {
+            if (pc.iceGatheringState === "complete") {
+              pc.removeEventListener("icegatheringstatechange", onState);
+              resolve();
+            }
+          };
+          pc.addEventListener("icegatheringstatechange", onState);
+          // fallback timeout to avoid blocking forever
+          setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onState);
+            resolve();
+          }, timeout);
+        });
+      }
+
+      // Create Offer Link (Initiator)
+      createLinkBtn.onclick = async () => {
+        try {
+          setStatus("creating offer...");
+          createLinkBtn.disabled = true;
+          setupPeerConnection();
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          // wait for ICE candidates to be gathered (so SDP contains ICE)
+          await waitForIceGatheringComplete(pc, 8000);
+          const localDesc = pc.localDescription;
+          if (!localDesc) throw new Error("No localDescription");
+          // payload includes sdp and type
+          const payload = {
+            role: "offer",
+            sdp: localDesc.sdp,
+            type: localDesc.type,
+            ts: Date.now(),
+          };
+          const code = encodePayload(payload);
+          // form a URL for easy sharing: use current origin + path + #code
+          const url = location.origin + location.pathname + "#" + code;
+          offerLinkBox.textContent = url;
+          copyOfferBtn.disabled = false;
+          setStatus("Offer link created — send it to the callee");
+          answerLinkBox.textContent = "No answer yet";
+          copyAnswerBtn.disabled = true;
+          endBtn.disabled = false;
+        } catch (e) {
+          alert("Create offer failed: " + e.message);
+          setStatus("create offer error");
+          createLinkBtn.disabled = false;
+        }
+      };
+
+      copyOfferBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(offerLinkBox.textContent);
+          alert("Offer link copied");
+        } catch (e) {
+          alert("Copy failed: " + e.message);
+        }
+      };
+
+      // Accept an offer from the current page URL fragment (open link then click this), OR use paste box
+      acceptFromLinkBtn.onclick = async () => {
+        // Try parse fragment first, else use paste box
+        const frag = location.hash ? location.hash.slice(1) : null;
+        const candidate = frag && decodePayload(frag);
+        const pasted =
+          pasteLinkInput.value && parseLinkFromString(pasteLinkInput.value);
+        const payload =
+          candidate && candidate.role === "offer"
+            ? candidate
+            : pasted && pasted.role === "offer"
+            ? pasted
+            : null;
+        if (!payload) {
+          alert(
+            "No offer payload found in URL fragment or paste box. Paste the offer link and click Accept."
+          );
+          return;
+        }
+
+        try {
+          setStatus("accepting offer...");
+          setupPeerConnection();
+          await pc.setRemoteDescription({
+            type: payload.type,
+            sdp: payload.sdp,
+          });
+          setStatus("remote offer set, creating answer...");
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          // wait for ICE to finish
+          await waitForIceGatheringComplete(pc, 8000);
+          const localDesc = pc.localDescription;
+          const resp = {
+            role: "answer",
+            type: localDesc.type,
+            sdp: localDesc.sdp,
+            ts: Date.now(),
+          };
+          const code = encodePayload(resp);
+          const url = location.origin + location.pathname + "#" + code;
+          answerLinkBox.textContent = url;
+          copyAnswerBtn.disabled = false;
+          setStatus("Answer link generated — send it back to initiator");
+          endBtn.disabled = false;
+          // clear fragment to avoid stale re-open
+          // location.hash = '';
+        } catch (e) {
+          alert("Failed to accept offer: " + e.message);
+          setStatus("accept error");
+        }
+      };
+
+      copyAnswerBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(answerLinkBox.textContent);
+          alert("Answer link copied");
+        } catch (e) {
+          alert("Copy failed: " + e.message);
+        }
+      };
+
+      // open link button — handles either offer or answer payload pasted by user
+      openLinkBtn.onclick = async () => {
+        const raw = pasteLinkInput.value.trim();
+        if (!raw)
+          return alert("Paste a full link (offer or answer) into the box");
+        const parsed = parseLinkFromString(raw);
+        if (!parsed) return alert("Could not parse link/payload");
+        if (parsed.role === "offer") {
+          // act as callee
+          // same as acceptFromLinkBtn logic but using parsed payload
+          try {
+            setStatus("handling pasted offer...");
+            setupPeerConnection();
+            await pc.setRemoteDescription({
+              type: parsed.type,
+              sdp: parsed.sdp,
+            });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await waitForIceGatheringComplete(pc, 8000);
+            const localDesc = pc.localDescription;
+            const resp = {
+              role: "answer",
+              type: localDesc.type,
+              sdp: localDesc.sdp,
+              ts: Date.now(),
+            };
+            const code = encodePayload(resp);
+            const url = location.origin + location.pathname + "#" + code;
+            answerLinkBox.textContent = url;
+            copyAnswerBtn.disabled = false;
+            setStatus("Answer generated — send back to initiator");
+            endBtn.disabled = false;
+          } catch (e) {
+            alert("Error handling offer: " + e.message);
+            setStatus("error");
+          }
+        } else if (parsed.role === "answer") {
+          // initiator handling answer
+          try {
+            setStatus("handling pasted answer...");
+            if (!pc) {
+              alert(
+                "You need to have created an offer first (Create Offer Link) before accepting this answer."
+              );
+              return;
+            }
+            await pc.setRemoteDescription({
+              type: parsed.type,
+              sdp: parsed.sdp,
+            });
+            setStatus("Remote answer set — connecting...");
+            endBtn.disabled = false;
+          } catch (e) {
+            alert("Error handling answer: " + e.message);
+            setStatus("error");
+          }
+        } else {
+          alert("Unknown payload role in link");
+        }
+      };
+
+      // parse a full link string and return decoded payload if present
+      function parseLinkFromString(link) {
+        try {
+          // accept a raw fragment code or a full URL containing #code
+          let code = link;
+          const hashIndex = link.indexOf("#");
+          if (hashIndex !== -1) code = link.slice(hashIndex + 1);
+          const decoded = decodePayload(code);
+          return decoded;
+        } catch (e) {
+          return null;
+        }
+      }
+
+      // On page load: if URL fragment contains an "answer" payload and we already had created offer, auto-handle it
+      window.addEventListener("load", async () => {
+        const frag = location.hash ? location.hash.slice(1) : null;
+        if (!frag) return;
+        const payload = decodePayload(frag);
+        if (!payload) return;
+        // if this is an answer and pc exists, set remote desc automatically
+        if (payload.role === "answer") {
+          // Attempt to set remote answer if pc exists (initiator)
+          if (pc && pc.signalingState !== "closed") {
+            try {
+              await pc.setRemoteDescription({
+                type: payload.type,
+                sdp: payload.sdp,
+              });
+              setStatus(
+                "Auto-applied answer from URL fragment — connecting..."
+              );
+            } catch (e) {
+              console.warn("Auto-apply answer failed", e);
+            }
+          } else {
+            // Not ready — show it in paste box so user can manually open
+            pasteLinkInput.value = location.href;
+            setStatus(
+              "Answer link detected in URL. Paste/open it to connect (or create offer first)."
+            );
+          }
+        } else if (payload.role === "offer") {
+          // If an offer is present in URL and user loaded it, help them accept
+          pasteLinkInput.value = location.href;
+          setStatus(
+            'Offer link detected in URL. Click "Accept Offer from URL" to answer.'
+          );
+        }
+      });
+
+      // hang up
+      function hangup() {
+        try {
+          if (pc) pc.close();
+        } catch (e) {}
+        pc = null;
+        remotes.innerHTML = "";
+        answerLinkBox.textContent = "No answer yet";
+        offerLinkBox.textContent = "No link yet";
+        copyOfferBtn.disabled = true;
+        copyAnswerBtn.disabled = true;
+        endBtn.disabled = true;
+        createLinkBtn.disabled = false;
+        stopTimer();
+        setStatus("Call ended");
+      }
+
+      // Automatically clear fragment when user clicks create/accept to avoid accidental re-use
+      function clearFragment() {
+        try {
+          history.replaceState(null, "", location.pathname);
+        } catch (e) {}
+      }
+    </script>
+  </body>
+</html>
